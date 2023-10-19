@@ -1,9 +1,13 @@
 const std = @import("std");
 
 const OUT_FILE = "out.bin";
-const BUFFER_SIZE = 4096;
+const BUFFER_SIZE: u64 = 4096;
 
-fn readNBytes(allocator: *const std.mem.Allocator, filename: []const u8, n: usize) ![]const u8 {
+fn readNBytes(
+    allocator: *const std.mem.Allocator,
+    filename: []const u8,
+    n: usize,
+) ![]const u8 {
     const file = try std.fs.cwd().openFile(filename, .{});
     defer file.close();
 
@@ -61,26 +65,75 @@ const Benchmark = struct {
     }
 };
 
+fn benchmarkIOUringNEntries(
+    allocator: *const std.mem.Allocator,
+    data: []const u8,
+    nEntries: u13,
+) !void {
+    const name = try std.fmt.allocPrint(allocator.*, "iouring_{}_entries", .{nEntries});
+    defer allocator.free(name);
+
+    var b = try Benchmark.init(allocator, name, data);
+    defer b.stop();
+
+    var ring = try std.os.linux.IO_Uring.init(nEntries, 0);
+    defer ring.deinit();
+
+    var cqes = try allocator.alloc(std.os.linux.io_uring_cqe, nEntries);
+    defer allocator.free(cqes);
+
+    var i: usize = 0;
+    while (i < data.len) : (i += BUFFER_SIZE * nEntries) {
+        var submittedEntries: u32 = 0;
+        var j: usize = 0;
+        while (j < nEntries) : (j += 1) {
+            const base = i + j * BUFFER_SIZE;
+            if (base >= data.len) {
+                break;
+            }
+            submittedEntries += 1;
+            const size = @min(BUFFER_SIZE, data.len - base);
+            _ = try ring.write(0, b.file.handle, data[base .. base + size], base);
+        }
+
+        const submitted = try ring.submit_and_wait(submittedEntries);
+        std.debug.assert(submitted == submittedEntries);
+
+        const waited = try ring.copy_cqes(cqes[0..submitted], submitted);
+        std.debug.assert(waited == submitted);
+
+        for (cqes[0..submitted]) |*cqe| {
+            std.debug.assert(cqe.err() == .SUCCESS);
+            std.debug.assert(cqe.res >= 0);
+            const n = @as(usize, @intCast(cqe.res));
+            std.debug.assert(n <= BUFFER_SIZE);
+        }
+    }
+}
+
 pub fn main() !void {
     var allocator = &std.heap.page_allocator;
 
     const SIZE = 104857600; // 100MiB
-    var x = try readNBytes(allocator, "/dev/random", SIZE);
-    defer allocator.free(x);
+    var data = try readNBytes(allocator, "/dev/random", SIZE);
+    defer allocator.free(data);
 
     const RUNS = 10;
     var run: usize = 0;
     while (run < RUNS) : (run += 1) {
         {
-            var b = try Benchmark.init(allocator, "blocking", x);
+            var b = try Benchmark.init(allocator, "blocking", data);
             defer b.stop();
 
             var i: usize = 0;
-            while (i < x.len) : (i += BUFFER_SIZE) {
-                const size = @min(BUFFER_SIZE, x.len - i);
-                const n = try b.file.write(x[i .. i + size]);
+            while (i < data.len) : (i += BUFFER_SIZE) {
+                const size = @min(BUFFER_SIZE, data.len - i);
+                const n = try b.file.write(data[i .. i + size]);
                 std.debug.assert(n == size);
             }
         }
+
+        try benchmarkIOUringNEntries(allocator, data, 1);
+        try benchmarkIOUringNEntries(allocator, data, 128);
     }
 }
