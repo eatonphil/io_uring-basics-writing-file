@@ -4,11 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"sync"
-	"syscall"
 	"time"
-
-	"github.com/iceber/iouring-go"
 )
 
 func assert(b bool) {
@@ -64,12 +60,11 @@ func benchmark(name string, x []byte, fn func(*os.File)) {
 	assert(bytes.Equal(readNBytes("out.bin", len(x)), x))
 }
 
-const RUNS = 10
-
 func main() {
-	size := 1073741824 // 1GiB
+	size := 104857600 // 100MiB
 	x := readNBytes("/dev/random", size)
 
+	const RUNS = 10
 	for i := 0; i < RUNS; i++ {
 		benchmark("blocking", x, func(f *os.File) {
 			for i := 0; i < len(x); i += BUFFER_SIZE {
