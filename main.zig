@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const OUT_FILE = "out.bin";
-const BUFFER_SIZE: u64 = 4096;
+const BUFFER_SIZE: u64 = 1048576; // 4096;
 
 fn readNBytes(
     allocator: *const std.mem.Allocator,
@@ -82,31 +82,34 @@ fn benchmarkIOUringNEntries(
     var cqes = try allocator.alloc(std.os.linux.io_uring_cqe, nEntries);
     defer allocator.free(cqes);
 
+    var written: usize = 0;
     var i: usize = 0;
-    while (i < data.len) : (i += BUFFER_SIZE * nEntries) {
+    while (i < data.len or written < data.len) {
         var submittedEntries: u32 = 0;
         var j: usize = 0;
-        while (j < nEntries) : (j += 1) {
+        while (true) {
             const base = i + j * BUFFER_SIZE;
             if (base >= data.len) {
                 break;
             }
-            submittedEntries += 1;
             const size = @min(BUFFER_SIZE, data.len - base);
-            _ = try ring.write(0, b.file.handle, data[base .. base + size], base);
+            _ = ring.write(0, b.file.handle, data[base .. base + size], base) catch |e| switch (e) {
+                error.SubmissionQueueFull => break,
+                else => unreachable,
+            };
+            submittedEntries += 1;
+            i += size;
         }
 
-        const submitted = try ring.submit_and_wait(submittedEntries);
-        std.debug.assert(submitted == submittedEntries);
+        _ = try ring.submit_and_wait(0);
+        const cqesDone = try ring.copy_cqes(cqes, 0);
 
-        const waited = try ring.copy_cqes(cqes[0..submitted], submitted);
-        std.debug.assert(waited == submitted);
-
-        for (cqes[0..submitted]) |*cqe| {
+        for (cqes[0..cqesDone]) |*cqe| {
             std.debug.assert(cqe.err() == .SUCCESS);
             std.debug.assert(cqe.res >= 0);
             const n = @as(usize, @intCast(cqe.res));
             std.debug.assert(n <= BUFFER_SIZE);
+            written += n;
         }
     }
 }
@@ -114,7 +117,7 @@ fn benchmarkIOUringNEntries(
 pub fn main() !void {
     var allocator = &std.heap.page_allocator;
 
-    const SIZE = 104857600; // 100MiB
+    const SIZE = 1073741824; //104857600; // 100MiB
     var data = try readNBytes(allocator, "/dev/random", SIZE);
     defer allocator.free(data);
 
